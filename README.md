@@ -1,6 +1,6 @@
 # GraphQL schema embedder MCP server
 
-Python MCP server for LLMs that indexes a GraphQL schema, stores embeddings per `type->field` via an OpenAI-compatible endpoint, and enables fast lookup plus `run_query` execution once relevant types are identified to fetch data from your GraphQL endpoint.
+Python MCP server for LLMs that indexes a GraphQL schema, stores embeddings per `type->field` via an embeddings endpoint, and enables fast lookup plus `run_query` execution once relevant types are identified to fetch data from your GraphQL endpoint.
 
 ## Architecture
 - GraphQL schema: provide a schema file (SDL) to exercise parsing and indexing.

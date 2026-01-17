@@ -1,0 +1,18 @@
+%%{init: {"theme": "neutral", "flowchart": {"curve": "basis"}}}%%
+flowchart LR
+  classDef node fill:#f8fafc,stroke:#0f172a,stroke-width:1px,color:#0f172a
+  classDef accent fill:#e2e8f0,stroke:#0f172a,stroke-width:1px,color:#0f172a
+  classDef store fill:#ecfeff,stroke:#0f172a,stroke-width:1px,color:#0f172a
+  classDef external fill:#fef9c3,stroke:#0f172a,stroke-width:1px,color:#0f172a
+
+  LLM["LLM / Client"]:::node
+  MCP["GraphQL MCP Server"]:::accent
+  IDX[("Embeddings Index")]:::store
+  EMBED["Embeddings API"]:::external
+  GQL["GraphQL Endpoint"]:::external
+
+  LLM -->|tools| MCP
+  MCP -->|embed + search| EMBED
+  EMBED -->|vectors| IDX
+  IDX -->|matches| MCP
+  MCP -->|query| GQL
