@@ -59,9 +59,11 @@ for _path in _ENV_PATHS:
 
 DEFAULT_TRANSPORT = os.environ.get("MCP_TRANSPORT", os.environ.get("FASTMCP_TRANSPORT", "sse"))
 DEFAULT_INSTRUCTIONS = (
-    "You are an information lookup assistant. Treat this MCP server as an abstraction layer for GraphQL "
+    "You are an information lookup assistant. Treat this MCP server as an abstraction layer for GraphQL. "
     "For any user question, first call list_types with a focused query. Prefer Query fields "
-    "and their query_template. Then call run_query with a single, valid query. Avoid unnecessary tool calls."
+    "and their query_template. If a list-returning Query field fails at runtime (e.g., Expected Iterable), "
+    "retry with the corresponding Connection field (fieldNameConnection). Then call run_query with a single, "
+    "valid query. Avoid unnecessary tool calls."
 )
 MCP_INSTRUCTIONS = os.environ.get("MCP_INSTRUCTIONS", DEFAULT_INSTRUCTIONS)
 
@@ -94,6 +96,7 @@ _INDEX_LOCK = threading.Lock()
 _SCALAR_TYPES = {"String", "Int", "Float", "Boolean", "ID"}
 _AGGREGATE_KEYWORDS = {"count", "total", "sum", "avg", "average", "how many", "number of"}
 _AGGREGATE_FIELD_PATTERNS = {"count", "total", "sum", "avg", "aggregate"}
+_LIST_QUERY_KEYWORDS = {"items", "list", "all", "show", "find", "get", "fetch", "search"}
 
 mcp = FastMCP(APP_NAME, instructions=MCP_INSTRUCTIONS)
 mcp.dependencies = ["graphql-core", "numpy", "aiohttp"]
@@ -275,6 +278,31 @@ def _is_connection_field(field_name: str) -> bool:
     return field_name.lower().endswith("connection")
 
 
+def _is_list_return(return_type: str) -> bool:
+    return return_type.strip().startswith("[")
+
+
+def _is_list_query(tokens: list[str]) -> bool:
+    return any(token in _LIST_QUERY_KEYWORDS for token in tokens)
+
+
+def _token_match_fields(type_name: str, fields_by_type: dict[str, list[dict]], tokens: list[str]) -> bool:
+    for field in fields_by_type.get(type_name, []):
+        if _token_score(tokens, field.get("field_name", ""), field.get("summary", "")) > 0:
+            return True
+    return False
+
+
+def _token_match_return_type(return_type: str, fields_by_type: dict[str, list[dict]], tokens: list[str]) -> bool:
+    base_type = _base_type(return_type)
+    if _token_match_fields(base_type, fields_by_type, tokens):
+        return True
+    if base_type.endswith("Connection"):
+        candidate = base_type[: -len("Connection")]
+        if candidate and candidate in fields_by_type:
+            return _token_match_fields(candidate, fields_by_type, tokens)
+    return False
+
 def _parse_field_info(meta: dict) -> dict[str, list[dict]]:
     fields_by_type: dict[str, list[dict]] = {}
     for item in meta.get("items", []):
@@ -394,6 +422,7 @@ def list_types(query: str, limit: int = 20) -> list:
     fields_by_type = _parse_field_info(meta)
     tokens = _tokenize(query)
     is_aggregate = _is_aggregate_query(query)
+    is_list_query = _is_list_query(tokens)
 
     capped_limit = max(1, min(limit, 20))
     query_vec = embedder.embed_one(query)
@@ -410,7 +439,12 @@ def list_types(query: str, limit: int = 20) -> list:
         is_query_type = item.get("type") == "Query"
         is_agg_field = _is_aggregate_field(field_name)
         is_conn_field = _is_connection_field(field_name)
+        summary = item.get("summary", "")
+        signature = summary.split(" | ", 1)[0]
+        _, _, _, return_type = _parse_signature(signature)
+        is_list_field = _is_list_return(return_type)
         score = item.get("score", 0.0)
+        token_match = _token_match_return_type(return_type, fields_by_type, tokens)
 
         if is_aggregate:
             # For aggregate queries: prioritize count fields, then connections
@@ -421,9 +455,13 @@ def list_types(query: str, limit: int = 20) -> list:
                 -score,             # Then by score
             )
         else:
-            # For non-aggregate queries: standard ordering
+            # For non-aggregate queries: prefer Query, then token-matched returns, then connections for list queries.
             return (
                 not is_query_type,
+                not token_match,
+                not (is_list_query and is_conn_field),
+                not (is_list_query and is_list_field),
+                is_list_query and is_agg_field,
                 -score,
             )
 
@@ -503,7 +541,7 @@ def run_query(query: str) -> dict:
             raise RuntimeError(f"Endpoint query failed: {exc}")
         output: dict = {"valid": not bool(result.get("errors"))}
         if "errors" in result:
-            output["errors"] = result["errors"]
+            output["errors"] = _augment_endpoint_errors(result["errors"])
         if "data" in result:
             output["data"] = result["data"]
         if "extensions" in result:
@@ -518,6 +556,45 @@ def run_query(query: str) -> dict:
     if result.data is not None:
         output["data"] = result.data
     return output
+
+
+def _augment_endpoint_errors(errors: list[dict]) -> list[dict]:
+    if not errors:
+        return errors
+    try:
+        meta = ensure_schema_indexed(force=False)
+        fields_by_type = _parse_field_info(meta)
+    except Exception:
+        fields_by_type = {}
+
+    augmented = []
+    for err in errors:
+        augmented.append(err)
+        message = str(err.get("message", ""))
+        path = err.get("path") or []
+        if "Expected Iterable" in message and path:
+            field_name = str(path[0])
+            connection_name = f"{field_name}Connection"
+            has_connection = any(
+                field.get("field_name") == connection_name
+                for field in fields_by_type.get("Query", [])
+            )
+            if has_connection:
+                augmented.append(
+                    {
+                        "message": (
+                            f"Hint: `{field_name}` returned a non-list. "
+                            f"Try `{connection_name}` for a connection-based query."
+                        )
+                    }
+                )
+        if "Cannot query field" in message:
+            augmented.append(
+                {
+                    "message": "Hint: Run `list_types` with a focused query to discover valid fields."
+                }
+            )
+    return augmented
 
 
 if __name__ == "__main__":
