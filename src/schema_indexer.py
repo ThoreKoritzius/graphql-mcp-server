@@ -1,3 +1,11 @@
+"""
+Schema indexing utilities for the GraphQL MCP server.
+
+This module flattens a GraphQL SDL schema into type.field signatures, embeds the
+summaries via an OpenAI-compatible embeddings endpoint, and persists normalized
+vectors to disk for fast similarity search. It is used both by the MCP server
+and the CLI entry point to build/search the local index.
+"""
 from __future__ import annotations
 
 import argparse
