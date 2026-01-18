@@ -41,9 +41,30 @@ python3 src/src/server.py --endpoint https://api.example.com/graphql --header "A
 # Options: --host 0.0.0.0 --port 9000 --log-level DEBUG --mount-path /myapp
 ```
 Tools:
-- `list_types(query, limit=5)` – fuzzy search over `type.field` signatures (embeddings; auto-build index if missing). Results are ordered with `Query` fields first and include a `query_template` for `Query` fields plus a `selection_hint` for object fields.
+- `list_types(query, limit=5)` – fuzzy search over `type.field` signatures (embeddings; auto-build index if missing). Results are ordered with `Query` fields first and include a `query` for `Query` fields plus a `select` hint for object fields. Output is compacted to reduce tokens.
 - `run_query(query)` – if `--endpoint` is set, proxies the query to the endpoint; otherwise validates/runs against the local schema (no resolvers; primarily for validation/shape checking, data resolves to null).
 Both indexing and querying use the same embedding model (`text-embedding-3-small` by default, override via config/env or `--model`).
+
+Ranking + cutoff (list_types):
+- Scoring formula (non-aggregate):
+```text
+score =
+  embedding_score
+  + 0.30 * I[is_query]
+  + 0.20 * I[token_match]
+  + 0.15 * I[list_query & connection]
+  + 0.05 * I[list_query & list]
+  - 0.20 * I[list_query & count]
+```
+- Scoring formula (aggregate):
+```text
+score =
+  embedding_score
+  + 0.30 * I[is_query]
+  + 0.25 * I[is_count]
+  + 0.10 * I[is_connection]
+```
+- Dynamic cutoff: keep items where `score >= 0.75 * max_score` or `token_match`; always keep at least 3 and at most `limit`.
 
 Example `list_types` output:
 ```json
@@ -52,19 +73,19 @@ Example `list_types` output:
     "type": "Query",
     "field": "users",
     "summary": "Query.users(limit: Int = 10, offset: Int = 0) -> [User!]!",
-    "query_template": "query { users(limit: <Int = 10>, offset: <Int = 0>) { id name email profile { joinedAt preferences { newsletter } } orders { id status total } } }"
+    "query": "query { users(limit: <Int = 10>, offset: <Int = 0>) { id name email profile { joinedAt preferences { newsletter } } orders { id status total } } }"
   },
   {
     "type": "User",
     "field": "orders",
     "summary": "User.orders -> [Order!]!",
-    "selection_hint": "orders { id status total items { quantity subtotal } }"
+    "select": "orders { id status total items { quantity subtotal } }"
   },
   {
     "type": "Product",
     "field": "reviews",
     "summary": "Product.reviews -> [Review!]!",
-    "selection_hint": "reviews { id rating title author { id name } }"
+    "select": "reviews { id rating title author { id name } }"
   }
 ]
 ```

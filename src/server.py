@@ -9,7 +9,7 @@ How `list_types` works:
 - Embed the user query and search the persisted index.
 - Re-rank hits: Query fields first; if the query looks like aggregation, prefer count/aggregate fields;
   then fall back to embedding similarity.
-- Parse each signature to build a ready-to-run `query_template`.
+- Parse each signature to build a ready-to-run `query` field.
 - Generate selection sets for object returns and add hints for connection pagination or aggregate fields.
 
 How `run_query` works:
@@ -61,7 +61,7 @@ DEFAULT_TRANSPORT = os.environ.get("MCP_TRANSPORT", os.environ.get("FASTMCP_TRAN
 DEFAULT_INSTRUCTIONS = (
     "You are an information lookup assistant. Treat this MCP server as an abstraction layer for GraphQL. "
     "For any user question, first call list_types with a focused query. Prefer Query fields "
-    "and their query_template. If a list-returning Query field fails at runtime (e.g., Expected Iterable), "
+    "and their query. If a list-returning Query field fails at runtime (e.g., Expected Iterable), "
     "retry with the corresponding Connection field (fieldNameConnection). Then call run_query with a single, "
     "valid query. Avoid unnecessary tool calls."
 )
@@ -428,44 +428,62 @@ def list_types(query: str, limit: int = 20) -> list:
     query_vec = embedder.embed_one(query)
     results = store.search(query_vec, limit=capped_limit)
 
-    def sort_key(item: dict) -> tuple:
-        """
-        Sort results with smart prioritization:
-        - Query fields first
-        - For aggregate queries: count/aggregate fields first
-        - Then by embedding similarity score
-        """
-        field_name = item.get("field", "")
+    def _item_context(item: dict) -> dict:
+        summary = item.get("summary", "")
+        signature = summary.split(" | ", 1)[0]
+        _, field_name, _, return_type = _parse_signature(signature)
         is_query_type = item.get("type") == "Query"
         is_agg_field = _is_aggregate_field(field_name)
         is_conn_field = _is_connection_field(field_name)
-        summary = item.get("summary", "")
-        signature = summary.split(" | ", 1)[0]
-        _, _, _, return_type = _parse_signature(signature)
         is_list_field = _is_list_return(return_type)
-        score = item.get("score", 0.0)
         token_match = _token_match_return_type(return_type, fields_by_type, tokens)
-
+        score = float(item.get("score", 0.0))
         if is_aggregate:
-            # For aggregate queries: prioritize count fields, then connections
-            return (
-                not is_query_type,  # Query type first
-                not is_agg_field,   # Aggregate fields first
-                not is_conn_field,  # Connection fields second
-                -score,             # Then by score
+            heuristic = (
+                (0.3 if is_query_type else 0.0)
+                + (0.25 if is_agg_field else 0.0)
+                + (0.1 if is_conn_field else 0.0)
             )
         else:
-            # For non-aggregate queries: prefer Query, then token-matched returns, then connections for list queries.
-            return (
-                not is_query_type,
-                not token_match,
-                not (is_list_query and is_conn_field),
-                not (is_list_query and is_list_field),
-                is_list_query and is_agg_field,
-                -score,
+            heuristic = (
+                (0.3 if is_query_type else 0.0)
+                + (0.2 if token_match else 0.0)
+                + (0.15 if is_list_query and is_conn_field else 0.0)
+                + (0.05 if is_list_query and is_list_field else 0.0)
+                - (0.2 if is_list_query and is_agg_field else 0.0)
             )
+        combined = score + heuristic
+        return {
+            "field_name": field_name,
+            "return_type": return_type,
+            "is_query_type": is_query_type,
+            "is_agg_field": is_agg_field,
+            "is_conn_field": is_conn_field,
+            "is_list_field": is_list_field,
+            "token_match": token_match,
+            "score": score,
+            "combined": combined,
+        }
 
-    results.sort(key=sort_key)
+    contexts = {id(item): _item_context(item) for item in results}
+
+    results.sort(key=lambda item: contexts[id(item)]["combined"], reverse=True)
+    if results:
+        max_score = max(contexts[id(item)]["combined"] for item in results)
+        score_cutoff = max_score * 0.75
+        min_keep = min(3, len(results))
+        filtered: list[dict] = []
+        for item in results:
+            ctx = contexts[id(item)]
+            if (
+                len(filtered) < min_keep
+                or ctx["combined"] >= score_cutoff
+                or ctx["token_match"]
+            ):
+                filtered.append(item)
+            if len(filtered) >= capped_limit:
+                break
+        results = filtered
 
     formatted = []
     for item in results:
