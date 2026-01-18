@@ -520,7 +520,15 @@ def list_types(query: str, limit: int = 20) -> list:
             if selection:
                 entry["selection_hint"] = f"{field_name} {selection}"
 
-        formatted.append(entry)
+        # Compact output: omit redundant Query type and shorten keys to save tokens in tool calls.
+        compact = {"field": entry["field"], "summary": entry["summary"]}
+        if entry.get("type") != "Query":
+            compact["type"] = entry["type"]
+        if "query_template" in entry:
+            compact["query"] = entry["query_template"]
+        if "selection_hint" in entry:
+            compact["select"] = entry["selection_hint"]
+        formatted.append(compact)
 
     return formatted
 
