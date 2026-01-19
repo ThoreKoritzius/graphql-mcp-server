@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable, List
@@ -23,6 +25,7 @@ from embedding_client import EmbeddingClient
 
 DEFAULT_DATA_DIR = Path(__file__).parent / "data"
 DEFAULT_SCHEMA_PATH = Path(__file__).parent / "schema.graphql"
+DEFAULT_EMBED_BATCH_SIZE = 128
 
 
 @dataclass
@@ -76,6 +79,39 @@ def flatten_schema(schema_text: str) -> List[TypeField]:
             )
 
     return type_fields
+
+
+def _render_progress(current: int, total: int, width: int = 30) -> str:
+    if total <= 0:
+        return f"[{'-' * width}] 0/0 (0%)"
+    ratio = min(1.0, current / total)
+    filled = int(ratio * width)
+    bar = "#" * filled + "-" * (width - filled)
+    percent = int(ratio * 100)
+    return f"[{bar}] {current}/{total} ({percent}%)"
+
+
+def _embed_with_progress(embedder: EmbeddingClient, summaries: list[str]) -> np.ndarray:
+    total = len(summaries)
+    if total == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    batch_size_raw = os.environ.get("GRAPHQL_EMBED_BATCH_SIZE", str(DEFAULT_EMBED_BATCH_SIZE))
+    try:
+        batch_size = max(1, int(batch_size_raw))
+    except ValueError:
+        batch_size = DEFAULT_EMBED_BATCH_SIZE
+
+    vectors: list[np.ndarray] = []
+    for start in range(0, total, batch_size):
+        batch = summaries[start : start + batch_size]
+        vectors.append(embedder.embed_many(batch))
+        current = min(start + len(batch), total)
+        progress = _render_progress(current, total)
+        print(f"\rIndexing embeddings {progress}", end="", file=sys.stderr, flush=True)
+    print("", file=sys.stderr, flush=True)
+
+    return np.vstack(vectors)
 
 
 class EmbeddingStore:
@@ -185,7 +221,7 @@ def index_schema_text(
     items = flatten_schema(schema_text)
     summaries = [item.summary for item in items]
     embedder = _resolve_embedder(embed_model, embedder)
-    vectors = embedder.embed_many(summaries)
+    vectors = _embed_with_progress(embedder, summaries)
 
     schema_sha = compute_schema_sha(schema_text)
     store = store or EmbeddingStore(data_dir=data_dir, embedding_model=embedder.model)
