@@ -41,7 +41,7 @@ python3 src/src/server.py --endpoint https://api.example.com/graphql --header "A
 # Options: --host 0.0.0.0 --port 9000 --log-level DEBUG --mount-path /myapp
 ```
 Tools:
-- `list_types(query, limit=5)` – fuzzy search over `type.field` signatures (embeddings; auto-build index if missing). Results are ordered with `Query` fields first and include a `query` for `Query` fields plus a `select` hint for object fields. Output is compacted to reduce tokens.
+- `list_types(query, limit=5)` – fuzzy search over `type.field` signatures (embeddings; auto-build index if missing). Results are ordered by combined score (with a `Query` boost) and include a `query` for `Query` fields plus a `select` hint for object fields. Output is compacted to reduce tokens.
 - `run_query(query)` – if `--endpoint` is set, proxies the query to the endpoint; otherwise validates/runs against the local schema (no resolvers; primarily for validation/shape checking, data resolves to null).
 Both indexing and querying use the same embedding model (`text-embedding-3-small` by default, override via config/env or `--model`).
 
@@ -65,6 +65,7 @@ score =
   + 0.10 * I[is_connection]
 ```
 - Dynamic cutoff: keep items where `score >= 0.75 * max_score` or `token_match`; always keep at least 3 and at most `limit`.
+- Diversity guard: when `limit >= 5`, keep up to 3 non-`Query` items if available, with a softer cutoff to avoid `Query`-only starvation.
 
 Example `list_types` output:
 ```json

@@ -412,6 +412,91 @@ def ensure_schema_indexed(*, force: bool = False) -> dict:
         raise RuntimeError(f"Schema index not available for {SCHEMA_PATH}: {exc}")
 
 
+def _apply_cutoff_and_diversity(
+    results: list[dict],
+    contexts: dict[int, dict],
+    *,
+    capped_limit: int,
+) -> list[dict]:
+    if not results:
+        return results
+
+    max_score = max(contexts[id(item)]["combined"] for item in results)
+    score_cutoff = max_score * 0.75
+    min_keep = min(3, len(results))
+    eligible: list[dict] = []
+    for idx, item in enumerate(results):
+        ctx = contexts[id(item)]
+        if idx < min_keep or ctx["combined"] >= score_cutoff or ctx["token_match"]:
+            eligible.append(item)
+
+    selected = eligible[:capped_limit]
+    if not selected:
+        return selected
+
+    def _is_query(item: dict) -> bool:
+        return contexts[id(item)]["is_query_type"]
+
+    def _combined(item: dict) -> float:
+        return contexts[id(item)]["combined"]
+
+    non_query_available = [item for item in results if not _is_query(item)]
+    target_non_query = min(
+        len(non_query_available),
+        min(3, capped_limit // 5),
+    )
+    current_non_query = sum(1 for item in selected if not _is_query(item))
+    needed = target_non_query - current_non_query
+    if needed <= 0:
+        return selected
+
+    selected_ids = {id(item) for item in selected}
+    candidates = [
+        item
+        for item in eligible[capped_limit:]
+        if not _is_query(item) and id(item) not in selected_ids
+    ]
+    if len(candidates) < needed:
+        diversity_floor = max_score * 0.6
+        fallback = [
+            item
+            for item in results
+            if not _is_query(item)
+            and id(item) not in selected_ids
+            and contexts[id(item)]["combined"] >= diversity_floor
+        ]
+        for item in fallback:
+            if id(item) not in {id(candidate) for candidate in candidates}:
+                candidates.append(item)
+            if len(candidates) >= needed:
+                break
+
+    if not candidates:
+        return selected
+    candidates = candidates[:needed]
+
+    # Keep token matches if we can, but avoid all-Query starvation.
+    drop_candidates = [
+        item
+        for item in selected
+        if _is_query(item) and not contexts[id(item)]["token_match"]
+    ]
+    if len(drop_candidates) < needed:
+        drop_candidates.extend(
+            item for item in selected if _is_query(item) and contexts[id(item)]["token_match"]
+        )
+    drop_candidates.sort(key=_combined)
+
+    for candidate, drop_item in zip(candidates, drop_candidates):
+        if len(selected) >= capped_limit and drop_item in selected:
+            selected.remove(drop_item)
+        if candidate not in selected:
+            selected.append(candidate)
+
+    selected.sort(key=_combined, reverse=True)
+    return selected
+
+
 @mcp.tool()
 def list_types(query: str, limit: int = 20) -> list:
     """
@@ -425,8 +510,10 @@ def list_types(query: str, limit: int = 20) -> list:
     is_list_query = _is_list_query(tokens)
 
     capped_limit = max(1, min(limit, 20))
+    item_count = meta.get("count") or len(meta.get("items", [])) or capped_limit
+    candidate_limit = min(max(capped_limit * 4, 25), item_count)
     query_vec = embedder.embed_one(query)
-    results = store.search(query_vec, limit=capped_limit)
+    results = store.search(query_vec, limit=candidate_limit)
 
     def _item_context(item: dict) -> dict:
         summary = item.get("summary", "")
@@ -468,22 +555,11 @@ def list_types(query: str, limit: int = 20) -> list:
     contexts = {id(item): _item_context(item) for item in results}
 
     results.sort(key=lambda item: contexts[id(item)]["combined"], reverse=True)
-    if results:
-        max_score = max(contexts[id(item)]["combined"] for item in results)
-        score_cutoff = max_score * 0.75
-        min_keep = min(3, len(results))
-        filtered: list[dict] = []
-        for item in results:
-            ctx = contexts[id(item)]
-            if (
-                len(filtered) < min_keep
-                or ctx["combined"] >= score_cutoff
-                or ctx["token_match"]
-            ):
-                filtered.append(item)
-            if len(filtered) >= capped_limit:
-                break
-        results = filtered
+    results = _apply_cutoff_and_diversity(
+        results,
+        contexts,
+        capped_limit=capped_limit,
+    )
 
     formatted = []
     for item in results:
