@@ -117,7 +117,10 @@ mcp.run = _run_with_default_transport.__get__(mcp, FastMCP)
 
 def _run_indexing_or_exit() -> None:
     try:
-        ensure_schema_indexed(force=False)
+        logger.info("Preparing schema index on startup...")
+        meta = ensure_schema_indexed(force=False)
+        if not meta.get("indexed"):
+            logger.info("Schema index up-to-date (%s fields).", meta.get("count", 0))
     except Exception as exc:
         logger.error("Schema indexing failed: %s", exc)
         os._exit(1)

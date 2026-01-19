@@ -94,6 +94,7 @@ Example `list_types` output:
 Notes:
 - `python3 src/server.py` defaults to the `sse` transport; pass `--transport streamable-http` if you want HTTP instead.
 - You can also set env vars prefixed with `FASTMCP_` (e.g., `FASTMCP_HOST`, `FASTMCP_PORT`, `FASTMCP_LOG_LEVEL`) to override defaults.
+- The server ensures the schema index is built on startup; if embeddings are computed, a simple progress bar is printed. Set `GRAPHQL_EMBED_BATCH_SIZE` to tune the batch size.
 - The server exposes MCP `instructions` (override with `MCP_INSTRUCTIONS`) that describe the server as an abstraction layer and tell the LLM to use `list_types` then `run_query` with minimal tool calls.
 
 ## Quick test with the MCP Inspector
