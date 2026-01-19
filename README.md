@@ -1,10 +1,10 @@
 # GraphQL schema embedder MCP server
 
-Python MCP server for LLMs that indexes a GraphQL schema, stores embeddings per `type->field` via an embeddings endpoint, and enables fast lookup plus `run_query` execution once relevant types are identified to fetch data from your GraphQL endpoint.
+Python MCP server for LLMs that indexes a GraphQL schema, stores embeddings for executable schema paths via an embeddings endpoint, and enables fast lookup plus `run_query` execution once relevant paths are identified.
 
 ## Architecture
 - GraphQL schema: provide a schema file (SDL) to exercise parsing and indexing.
-- Indexer: `schema_indexer.py` flattens the schema into `type.field` signatures (with arguments and return types), embeds each summary via the configured embeddings endpoint, and persists to `data/metadata.json` + `data/vectors.npz` (normalized embeddings for cosine search).
+- Indexer: `schema_indexer.py` expands the schema into executable root paths (e.g., `Query.user(id).posts.title`), embeds each path summary via the configured embeddings endpoint, and persists to `data/metadata.json` + `data/vectors.npz` (normalized embeddings for cosine search).
 - Server: `server.py` exposes MCP tools `list_types` and `run_query`. The server ensures the schema index exists on startup; it only calls the embeddings endpoint when reindexing or embedding a new query.
 - Persistence: `data/` is `.gitignore`'d so you can regenerate locally without polluting the repo.
 
@@ -19,6 +19,10 @@ Environment configuration:
 - `GRAPHQL_EMBED_MODEL`
 - `GRAPHQL_EMBED_API_KEY_HEADER` / `GRAPHQL_EMBED_API_KEY_PREFIX`
 - `GRAPHQL_EMBED_HEADERS` (JSON object string for extra headers)
+- `GRAPHQL_INDEX_MAX_DEPTH` (max path depth for indexing, default: 4)
+- `GRAPHQL_EMBED_QUERY_TIMEOUT_S` (list_types embedding timeout, default: 20s)
+- `GRAPHQL_INDEX_READY_TIMEOUT_S` (list_types index wait timeout, default: 5s)
+- `GRAPHQL_LIST_TYPES_INCLUDE_QUERY` (include generated `query` in list_types output, default: false)
 Endpoint auth (when using `GRAPHQL_ENDPOINT_URL`):
 - `GRAPHQL_ENDPOINT_HEADERS` (JSON object string, merged with any `--header` flags)
 
@@ -41,7 +45,7 @@ python3 src/src/server.py --endpoint https://api.example.com/graphql --header "A
 # Options: --host 0.0.0.0 --port 9000 --log-level DEBUG --mount-path /myapp
 ```
 Tools:
-- `list_types(query, limit=5)` – fuzzy search over `type.field` signatures (embeddings; auto-build index if missing). Results are ordered with `Query` fields first and include a `query_template` for `Query` fields plus a `selection_hint` for object fields.
+- `list_types(query, limit=5)` – fuzzy search over executable schema paths (embeddings; auto-build index if missing). Results include a `path` plus a ready-to-run `query` when the path starts at a root operation.
 - `run_query(query)` – if `--endpoint` is set, proxies the query to the endpoint; otherwise validates/runs against the local schema (no resolvers; primarily for validation/shape checking, data resolves to null).
 Both indexing and querying use the same embedding model (`text-embedding-3-small` by default, override via config/env or `--model`).
 
@@ -49,25 +53,41 @@ Example `list_types` output:
 ```json
 [
   {
-    "type": "Query",
-    "field": "users",
+    "path": "Query.users(limit: Int = 10, offset: Int = 0)",
     "summary": "Query.users(limit: Int = 10, offset: Int = 0) -> [User!]!",
-    "query_template": "query { users(limit: <Int = 10>, offset: <Int = 0>) { id name email profile { joinedAt preferences { newsletter } } orders { id status total } } }"
+    "query": "query { users(limit: <Int = 10>, offset: <Int = 0>) { id name email profile { joinedAt preferences { newsletter } } orders { id status total } } }"
   },
   {
-    "type": "User",
-    "field": "orders",
-    "summary": "User.orders -> [Order!]!",
-    "selection_hint": "orders { id status total items { quantity subtotal } }"
+    "path": "Query.users(limit: Int = 10, offset: Int = 0).orders",
+    "summary": "Query.users(limit: Int = 10, offset: Int = 0).orders -> [Order!]!"
   },
   {
-    "type": "Product",
-    "field": "reviews",
-    "summary": "Product.reviews -> [Review!]!",
-    "selection_hint": "reviews { id rating title author { id name } }"
+    "path": "Query.products(limit: Int, offset: Int).reviews",
+    "summary": "Query.products(limit: Int, offset: Int).reviews -> [Review!]!"
   }
 ]
 ```
+
+Ranking + cutoff (list_types):
+- Scoring formula (non-aggregate):
+```text
+score =
+  embedding_score
+  + 0.30 * I[is_query]
+  + 0.20 * I[token_match]
+  + 0.15 * I[list_query & connection]
+  + 0.05 * I[list_query & list]
+  - 0.20 * I[list_query & count]
+```
+- Scoring formula (aggregate):
+```text
+score =
+  embedding_score
+  + 0.30 * I[is_query]
+  + 0.25 * I[is_count]
+  + 0.10 * I[is_connection]
+```
+- Dynamic cutoff: keep items where `score >= 0.75 * max_score` or `token_match`; always keep at least 3 and at most `limit`.
 
 Notes:
 - `python3 src/server.py` defaults to the `sse` transport; pass `--transport streamable-http` if you want HTTP instead.

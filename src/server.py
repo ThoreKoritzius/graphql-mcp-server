@@ -2,15 +2,13 @@
 GraphQL MCP server exposing `list_types` and `run_query` tools over a schema file or live endpoint.
 
 What it does:
-- Builds and caches an embedding index of `type.field` signatures for fuzzy search.
+- Builds and caches an embedding index of executable schema paths for fuzzy search.
 - Exposes `list_types` for discovery and `run_query` for validation/execution.
 
 How `list_types` works:
 - Embed the user query and search the persisted index.
-- Re-rank hits: Query fields first; if the query looks like aggregation, prefer count/aggregate fields;
-  then fall back to embedding similarity.
-- Parse each signature to build a ready-to-run `query_template`.
-- Generate selection sets for object returns and add hints for connection pagination or aggregate fields.
+- Score hits using a weighted combination of embedding similarity + heuristics.
+- Build a ready-to-run `query` from each executable path.
 
 How `run_query` works:
 - Local mode: validates against the SDL schema (no resolvers, so data is null-only).
@@ -25,6 +23,7 @@ import os
 import json
 import logging
 import threading
+import concurrent.futures
 from pathlib import Path
 from typing import Literal
 from urllib.error import HTTPError
@@ -32,6 +31,9 @@ from urllib.request import Request, urlopen
 
 from dotenv import load_dotenv
 from graphql import (
+    GraphQLList,
+    GraphQLNonNull,
+    GraphQLObjectType,
     build_client_schema,
     build_schema,
     get_introspection_query,
@@ -44,6 +46,7 @@ from config import load_embedder_config
 from embedding_client import EmbeddingClient
 from schema_indexer import (
     DEFAULT_DATA_DIR,
+    DEFAULT_MAX_PATH_DEPTH,
     DEFAULT_SCHEMA_PATH,
     EmbeddingStore,
     ensure_index,
@@ -61,7 +64,7 @@ DEFAULT_TRANSPORT = os.environ.get("MCP_TRANSPORT", os.environ.get("FASTMCP_TRAN
 DEFAULT_INSTRUCTIONS = (
     "You are an information lookup assistant. Treat this MCP server as an abstraction layer for GraphQL "
     "For any user question, first call list_types with a focused query. Prefer Query fields "
-    "and their query_template. Then call run_query with a single, valid query. Avoid unnecessary tool calls."
+    "and their query. Then call run_query with a single, valid query. Avoid unnecessary tool calls."
 )
 MCP_INSTRUCTIONS = os.environ.get("MCP_INSTRUCTIONS", DEFAULT_INSTRUCTIONS)
 
@@ -70,11 +73,16 @@ ENDPOINT_URL = os.environ.get("GRAPHQL_ENDPOINT_URL")
 DATA_DIR = Path(os.environ.get("GRAPHQL_EMBEDDER_DATA_DIR", str(DEFAULT_DATA_DIR)))
 EMBEDDER_CONFIG = load_embedder_config()
 EMBED_MODEL = EMBEDDER_CONFIG.model
+MAX_PATH_DEPTH = int(os.environ.get("GRAPHQL_INDEX_MAX_DEPTH", str(DEFAULT_MAX_PATH_DEPTH)))
+EMBED_QUERY_TIMEOUT_S = float(os.environ.get("GRAPHQL_EMBED_QUERY_TIMEOUT_S", "20"))
+INDEX_READY_TIMEOUT_S = float(os.environ.get("GRAPHQL_INDEX_READY_TIMEOUT_S", "5"))
+LIST_TYPES_INCLUDE_QUERY = os.environ.get("GRAPHQL_LIST_TYPES_INCLUDE_QUERY", "false").lower() in {"1", "true", "yes"}
 
 embedder = EmbeddingClient(config=EMBEDDER_CONFIG, model=EMBED_MODEL)
 store = EmbeddingStore(data_dir=DATA_DIR, embedding_model=embedder.model)
 SCHEMA_SOURCE: dict = {"kind": "file", "path": str(SCHEMA_PATH)}
 SCHEMA_TEXT: str | None = None
+_SCHEMA_CACHE = None
 def _load_endpoint_headers_from_env() -> dict[str, str]:
     raw = os.environ.get("GRAPHQL_ENDPOINT_HEADERS")
     if not raw:
@@ -91,9 +99,12 @@ def _load_endpoint_headers_from_env() -> dict[str, str]:
 _REMOTE_HEADERS: dict[str, str] = _load_endpoint_headers_from_env()
 _REMOTE_TIMEOUT_S: float = 30.0
 _INDEX_LOCK = threading.Lock()
+_INDEX_READY = False
+_INDEX_ERROR: str | None = None
 _SCALAR_TYPES = {"String", "Int", "Float", "Boolean", "ID"}
 _AGGREGATE_KEYWORDS = {"count", "total", "sum", "avg", "average", "how many", "number of"}
 _AGGREGATE_FIELD_PATTERNS = {"count", "total", "sum", "avg", "aggregate"}
+_LIST_QUERY_KEYWORDS = {"items", "list", "all", "show", "find", "get", "fetch", "search"}
 
 mcp = FastMCP(APP_NAME, instructions=MCP_INSTRUCTIONS)
 mcp.dependencies = ["graphql-core", "numpy", "aiohttp"]
@@ -112,10 +123,21 @@ def _run_with_default_transport(
 mcp.run = _run_with_default_transport.__get__(mcp, FastMCP)
 
 
-def _run_indexing_or_exit() -> None:
+def _run_indexing_background() -> None:
+    global _INDEX_READY, _INDEX_ERROR
     try:
-        ensure_schema_indexed(force=False)
+        if ENDPOINT_URL:
+            logger.info("Startup indexing (endpoint): %s", ENDPOINT_URL)
+        else:
+            logger.info("Startup indexing (schema): %s", SCHEMA_PATH)
+        meta = ensure_schema_indexed(force=False, allow_build=True)
+        if meta.get("indexed"):
+            logger.info("Startup indexing complete: %s paths.", meta.get("count", 0))
+        else:
+            logger.info("Index already up-to-date.")
+        _INDEX_READY = True
     except Exception as exc:
+        _INDEX_ERROR = str(exc)
         logger.error("Schema indexing failed: %s", exc)
         os._exit(1)
 
@@ -130,6 +152,8 @@ def configure_runtime(*, schema_path: Path, data_dir: Path, embed_model: str) ->
     store = EmbeddingStore(data_dir=DATA_DIR, embedding_model=embedder.model)
     SCHEMA_SOURCE = {"kind": "file", "path": str(SCHEMA_PATH)}
     SCHEMA_TEXT = None
+    global _SCHEMA_CACHE
+    _SCHEMA_CACHE = None
 
 
 def configure_runtime_endpoint(
@@ -149,6 +173,8 @@ def configure_runtime_endpoint(
     store = EmbeddingStore(data_dir=DATA_DIR, embedding_model=embedder.model)
     SCHEMA_SOURCE = schema_source
     SCHEMA_TEXT = schema_text
+    global _SCHEMA_CACHE
+    _SCHEMA_CACHE = None
 
 
 def _parse_headers(raw_headers: list[str] | None) -> dict[str, str]:
@@ -227,7 +253,14 @@ def _base_type(type_str: str) -> str:
         if base.startswith("[") and base.endswith("]"):
             base = base[1:-1].strip()
             continue
-        return base.rstrip("!")
+    return base.rstrip("!")
+
+
+def _base_gql_type(graphql_type):
+    base = graphql_type
+    while isinstance(base, (GraphQLNonNull, GraphQLList)):
+        base = base.of_type
+    return base
 
 
 def _tokenize(text: str) -> list[str]:
@@ -275,23 +308,135 @@ def _is_connection_field(field_name: str) -> bool:
     return field_name.lower().endswith("connection")
 
 
-def _parse_field_info(meta: dict) -> dict[str, list[dict]]:
+def _is_list_return(return_type: str) -> bool:
+    return return_type.strip().startswith("[")
+
+
+def _is_list_query(tokens: list[str]) -> bool:
+    return any(token in _LIST_QUERY_KEYWORDS for token in tokens)
+
+
+def _token_match_fields(type_name: str, fields_by_type: dict[str, list[dict]], tokens: list[str]) -> bool:
+    for field in fields_by_type.get(type_name, []):
+        if _token_score(tokens, field.get("field_name", ""), field.get("summary", "")) > 0:
+            return True
+    return False
+
+
+def _token_match_return_type(return_type: str, fields_by_type: dict[str, list[dict]], tokens: list[str]) -> bool:
+    base_type = _base_type(return_type)
+    if _token_match_fields(base_type, fields_by_type, tokens):
+        return True
+    if base_type.endswith("Connection"):
+        candidate = base_type[: -len("Connection")]
+        if candidate and candidate in fields_by_type:
+            return _token_match_fields(candidate, fields_by_type, tokens)
+    return False
+
+def _describe_type(graphql_type) -> str:
+    if isinstance(graphql_type, GraphQLNonNull):
+        return f"{_describe_type(graphql_type.of_type)}!"
+    if isinstance(graphql_type, GraphQLList):
+        return f"[{_describe_type(graphql_type.of_type)}]"
+    return str(graphql_type)
+
+
+def _load_schema():
+    global _SCHEMA_CACHE
+    if _SCHEMA_CACHE is not None:
+        return _SCHEMA_CACHE
+    if ENDPOINT_URL:
+        if not SCHEMA_TEXT:
+            raise RuntimeError("Endpoint mode requires schema introspection text.")
+        _SCHEMA_CACHE = build_schema(SCHEMA_TEXT)
+    else:
+        _SCHEMA_CACHE = build_schema(SCHEMA_PATH.read_text())
+    return _SCHEMA_CACHE
+
+
+def _fields_by_type_from_schema(schema) -> dict[str, list[dict]]:
     fields_by_type: dict[str, list[dict]] = {}
-    for item in meta.get("items", []):
-        summary = item.get("summary", "")
-        signature = summary.split(" | ", 1)[0]
-        type_name, field_name, args, return_type = _parse_signature(signature)
-        if not type_name or not field_name or not return_type:
+    for type_name, gql_type in sorted(schema.type_map.items()):
+        if type_name.startswith("__"):
             continue
-        info = {
-            "type_name": type_name,
-            "field_name": field_name,
-            "args": args,
-            "return_type": return_type,
-            "summary": summary,
-        }
-        fields_by_type.setdefault(type_name, []).append(info)
+        if not isinstance(gql_type, GraphQLObjectType):
+            continue
+        for field_name, field in sorted(gql_type.fields.items()):
+            arg_parts = [
+                f"{arg_name}: {_describe_type(arg.type)}"
+                for arg_name, arg in field.args.items()
+            ]
+            arg_list = ", ".join(arg_parts)
+            return_type = _describe_type(field.type)
+            signature = (
+                f"{type_name}.{field_name}({arg_list}) -> {return_type}"
+                if arg_list
+                else f"{type_name}.{field_name} -> {return_type}"
+            )
+            fields_by_type.setdefault(type_name, []).append(
+                {
+                    "type_name": type_name,
+                    "field_name": field_name,
+                    "args": [(arg_name, _describe_type(arg.type)) for arg_name, arg in field.args.items()],
+                    "return_type": return_type,
+                    "summary": signature,
+                }
+            )
     return fields_by_type
+
+
+def _split_path(path: str) -> list[str]:
+    parts: list[str] = []
+    current: list[str] = []
+    depth = 0
+    for ch in path:
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        elif ch == "." and depth == 0:
+            parts.append("".join(current))
+            current = []
+            continue
+        current.append(ch)
+    if current:
+        parts.append("".join(current))
+    return parts
+
+
+def _parse_path_segment(segment: str) -> tuple[str, list[tuple[str, str]]]:
+    if "(" in segment and segment.endswith(")"):
+        name, args_str = segment[:-1].split("(", 1)
+        args: list[tuple[str, str]] = []
+        for part in args_str.split(", "):
+            if not part:
+                continue
+            arg_name, _, arg_type = part.partition(": ")
+            if arg_name and arg_type:
+                args.append((arg_name, arg_type))
+        return name, args
+    return segment, []
+
+
+def _operation_keyword(root_name: str) -> str:
+    if root_name == "Mutation":
+        return "mutation"
+    if root_name == "Subscription":
+        return "subscription"
+    return "query"
+
+
+def _resolve_return_type(schema, root_name: str, segments: list[str]):
+    gql_type = schema.type_map.get(root_name)
+    for segment in segments:
+        if not isinstance(gql_type, GraphQLObjectType):
+            return None
+        field_name, _ = _parse_path_segment(segment)
+        field = gql_type.fields.get(field_name)
+        if field is None:
+            return None
+        gql_type = _base_gql_type(field.type)
+    return gql_type
 
 
 def _format_args(args: list[tuple[str, str]]) -> str:
@@ -349,36 +494,52 @@ def _render_selection_set(
     return "{ " + " ".join(selections) + " }"
 
 
-def ensure_schema_indexed(*, force: bool = False) -> dict:
+def ensure_schema_indexed(*, force: bool = False, allow_build: bool = True) -> dict:
     try:
+        if not allow_build:
+            if not _INDEX_LOCK.acquire(blocking=False):
+                raise RuntimeError("Indexing in progress. Try again shortly.")
+            try:
+                if _INDEX_ERROR:
+                    raise RuntimeError(_INDEX_ERROR)
+                if ENDPOINT_URL:
+                    if not SCHEMA_TEXT:
+                        raise RuntimeError("Endpoint mode requires schema introspection text.")
+                    if not store.is_ready():
+                        raise RuntimeError("Indexing in progress. Try again shortly.")
+                    return store.load()
+                if not store.is_ready():
+                    raise RuntimeError("Indexing in progress. Try again shortly.")
+                return store.load()
+            finally:
+                _INDEX_LOCK.release()
+
         with _INDEX_LOCK:
+            if _INDEX_ERROR:
+                raise RuntimeError(_INDEX_ERROR)
             if ENDPOINT_URL:
                 if not SCHEMA_TEXT:
                     raise RuntimeError("Endpoint mode requires schema introspection text.")
-                logger.info("Indexing schema from endpoint %s...", ENDPOINT_URL)
                 meta = ensure_index_text(
                     SCHEMA_TEXT,
                     schema_source=SCHEMA_SOURCE,
                     data_dir=DATA_DIR,
                     embed_model=EMBED_MODEL,
+                    max_depth=MAX_PATH_DEPTH,
                     embedder=embedder,
                     store=store,
                     force=force,
                 )
-                if meta.get("indexed"):
-                    logger.info("Indexed %s fields from endpoint schema.", meta.get("count", 0))
                 return meta
-            logger.info("Indexing schema from file %s...", SCHEMA_PATH)
             meta = ensure_index(
                 schema_path=SCHEMA_PATH,
                 data_dir=DATA_DIR,
                 embed_model=EMBED_MODEL,
+                max_depth=MAX_PATH_DEPTH,
                 embedder=embedder,
                 store=store,
                 force=force,
             )
-            if meta.get("indexed"):
-                logger.info("Indexed %s fields from schema %s.", meta.get("count", 0), SCHEMA_PATH)
             return meta
     except Exception as exc:
         raise RuntimeError(f"Schema index not available for {SCHEMA_PATH}: {exc}")
@@ -387,103 +548,174 @@ def ensure_schema_indexed(*, force: bool = False) -> dict:
 @mcp.tool()
 def list_types(query: str, limit: int = 20) -> list:
     """
-    Fuzzy search the schema for matching type.field signatures.
+    Fuzzy search the schema for matching executable schema paths.
     Uses the persisted embedding index (auto-builds if missing/outdated).
     """
-    meta = ensure_schema_indexed(force=False)
-    fields_by_type = _parse_field_info(meta)
+    if not _INDEX_READY and not store.is_ready():
+        raise RuntimeError("Indexing in progress. Try again shortly.")
+    logger.info("list_types start: query=%r limit=%s", query, limit)
+    meta = ensure_schema_indexed(force=False, allow_build=False)
+    logger.info("list_types: index loaded")
+    schema = _load_schema()
+    fields_by_type = _fields_by_type_from_schema(schema)
+    logger.info("list_types: schema loaded")
+    normalized_query = query.strip().lower()
     tokens = _tokenize(query)
     is_aggregate = _is_aggregate_query(query)
+    is_list_query = _is_list_query(tokens)
 
     capped_limit = max(1, min(limit, 20))
-    query_vec = embedder.embed_one(query)
-    results = store.search(query_vec, limit=capped_limit)
+    if normalized_query in {"query", "queries", "root"}:
+        raw_items = meta.get("items", [])
+        results = []
+        for item in raw_items:
+            path = item.get("path", "")
+            parts = _split_path(path)
+            if item.get("root_type") == "Query" and len(parts) == 2:
+                results.append(
+                    {
+                        "root_type": item.get("root_type"),
+                        "path": path,
+                        "return_type": item.get("return_type"),
+                        "summary": item.get("summary"),
+                        "score": 1.0,
+                    }
+                )
+            if len(results) >= capped_limit:
+                break
+    else:
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(embedder.embed_one, query)
+                query_vec = future.result(timeout=EMBED_QUERY_TIMEOUT_S)
+        except concurrent.futures.TimeoutError as exc:
+            raise RuntimeError(
+                f"Embedding query timed out after {EMBED_QUERY_TIMEOUT_S}s. "
+                "Check your embeddings endpoint or increase GRAPHQL_EMBED_QUERY_TIMEOUT_S."
+            ) from exc
+        logger.info("list_types: embedding ready")
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(store.search, query_vec, capped_limit)
+                results = future.result(timeout=EMBED_QUERY_TIMEOUT_S)
+        except concurrent.futures.TimeoutError as exc:
+            raise RuntimeError(
+                f"Index search timed out after {EMBED_QUERY_TIMEOUT_S}s. "
+                "Reduce GRAPHQL_INDEX_MAX_DEPTH or limit, or increase GRAPHQL_EMBED_QUERY_TIMEOUT_S."
+            ) from exc
+        logger.info("list_types: search complete (%s results)", len(results))
 
-    def sort_key(item: dict) -> tuple:
-        """
-        Sort results with smart prioritization:
-        - Query fields first
-        - For aggregate queries: count/aggregate fields first
-        - Then by embedding similarity score
-        """
-        field_name = item.get("field", "")
-        is_query_type = item.get("type") == "Query"
+    def _item_context(item: dict) -> dict:
+        path = item.get("path", "")
+        parts = _split_path(path)
+        root_type = item.get("root_type") or (parts[0] if parts else "")
+        field_name, _ = _parse_path_segment(parts[-1]) if parts else ("", [])
+        return_type = item.get("return_type") or item.get("summary", "").rsplit(" -> ", 1)[-1]
+        is_query_type = root_type == "Query"
         is_agg_field = _is_aggregate_field(field_name)
         is_conn_field = _is_connection_field(field_name)
-        score = item.get("score", 0.0)
+        is_list_field = _is_list_return(return_type)
+        token_match = _token_match_return_type(return_type, fields_by_type, tokens)
+        score = float(item.get("score", 0.0))
 
         if is_aggregate:
-            # For aggregate queries: prioritize count fields, then connections
-            return (
-                not is_query_type,  # Query type first
-                not is_agg_field,   # Aggregate fields first
-                not is_conn_field,  # Connection fields second
-                -score,             # Then by score
+            heuristic = (
+                (0.30 if is_query_type else 0.0)
+                + (0.25 if is_agg_field else 0.0)
+                + (0.10 if is_conn_field else 0.0)
             )
         else:
-            # For non-aggregate queries: standard ordering
-            return (
-                not is_query_type,
-                -score,
+            heuristic = (
+                (0.30 if is_query_type else 0.0)
+                + (0.20 if token_match else 0.0)
+                + (0.15 if is_list_query and is_conn_field else 0.0)
+                + (0.05 if is_list_query and is_list_field else 0.0)
+                - (0.20 if is_list_query and is_agg_field else 0.0)
             )
+        combined = score + heuristic
 
-    results.sort(key=sort_key)
-
-    formatted = []
-    for item in results:
-        summary = item.get("summary", "")
-        signature = summary.split(" | ", 1)[0]
-        type_name, field_name, args, return_type = _parse_signature(signature)
-
-        entry = {
-            "type": item.get("type"),
-            "field": item.get("field"),
-            "summary": summary,
+        return {
+            "path": path,
+            "root_type": root_type,
+            "return_type": return_type,
+            "token_match": token_match,
+            "combined": combined,
         }
 
-        if type_name == "Query":
-            selection = None
-            base_return = _base_type(return_type)
+    contexts = {id(item): _item_context(item) for item in results}
+    results.sort(key=lambda item: contexts[id(item)]["combined"], reverse=True)
 
-            # For Connection types, provide a complete pagination template
-            if _is_connection_field(field_name):
-                selection = _render_selection_set(
-                    base_return,
-                    fields_by_type,
-                    tokens,
-                    depth=2,
-                    max_fields=8,
-                )
-                selection_part = f" {selection}" if selection else ""
-                entry["query_template"] = f"query {{ {field_name}{_format_args(args)}{selection_part} }}"
-            elif _is_aggregate_field(field_name):
-                # Count fields return scalars, no selection needed
-                entry["query_template"] = f"query {{ {field_name}{_format_args(args)} }}"
-            elif base_return not in _SCALAR_TYPES:
-                selection = _render_selection_set(
-                    base_return,
-                    fields_by_type,
-                    tokens,
-                    depth=2,
-                    max_fields=6,
-                )
-                selection_part = f" {selection}" if selection else ""
-                entry["query_template"] = f"query {{ {field_name}{_format_args(args)}{selection_part} }}"
-            else:
-                entry["query_template"] = f"query {{ {field_name}{_format_args(args)} }}"
-        elif _base_type(return_type) not in _SCALAR_TYPES:
-            selection = _render_selection_set(
-                _base_type(return_type),
-                fields_by_type,
-                tokens,
-                depth=1,
-                max_fields=5,
-            )
-            if selection:
-                entry["selection_hint"] = f"{field_name} {selection}"
+    if results:
+        max_score = max(contexts[id(item)]["combined"] for item in results)
+        score_cutoff = max_score * 0.75
+        min_keep = min(3, len(results))
+        filtered: list[dict] = []
+        for item in results:
+            ctx = contexts[id(item)]
+            if (
+                len(filtered) < min_keep
+                or ctx["combined"] >= score_cutoff
+                or ctx["token_match"]
+            ):
+                filtered.append(item)
+            if len(filtered) >= capped_limit:
+                break
+        results = filtered
 
-        formatted.append(entry)
+    if not LIST_TYPES_INCLUDE_QUERY:
+        logger.info("list_types: query generation disabled")
+        return [{"path": item.get("path", ""), "summary": item.get("summary", "")} for item in results]
 
+    def _format_results() -> list[dict]:
+        formatted = []
+        for item in results:
+            path = item.get("path", "")
+            summary = item.get("summary", "")
+            parts = _split_path(path)
+            root_type = item.get("root_type") or (parts[0] if parts else "")
+            entry = {"path": path, "summary": summary}
+
+            if root_type in {"Query", "Mutation", "Subscription"} and len(parts) > 1:
+                segments = parts[1:]
+                leaf_type = _resolve_return_type(schema, root_type, segments)
+
+                def build_selection(segment_list: list[str]) -> str:
+                    name, args = _parse_path_segment(segment_list[0])
+                    arg_part = _format_args(args)
+                    if len(segment_list) == 1:
+                        if isinstance(leaf_type, GraphQLObjectType):
+                            selection = _render_selection_set(
+                                leaf_type.name,
+                                fields_by_type,
+                                tokens,
+                                depth=1,
+                                max_fields=5,
+                            )
+                            selection_part = f" {selection}" if selection else ""
+                            return f"{name}{arg_part}{selection_part}"
+                        return f"{name}{arg_part}"
+                    return f"{name}{arg_part} {{ {build_selection(segment_list[1:])} }}"
+
+                selection = build_selection(segments)
+                entry["query"] = f"{_operation_keyword(root_type)} {{ {selection} }}"
+
+            # Compact output: path + summary, plus query when the path is executable from a root op.
+            compact = {"path": entry["path"], "summary": entry["summary"]}
+            if "query" in entry:
+                compact["query"] = entry["query"]
+            formatted.append(compact)
+        return formatted
+
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(_format_results)
+            formatted = future.result(timeout=EMBED_QUERY_TIMEOUT_S)
+    except concurrent.futures.TimeoutError as exc:
+        raise RuntimeError(
+            f"Result formatting timed out after {EMBED_QUERY_TIMEOUT_S}s. "
+            "Reduce GRAPHQL_INDEX_MAX_DEPTH or limit."
+        ) from exc
+    logger.info("list_types: formatted %s results", len(formatted))
     return formatted
 
 
@@ -590,7 +822,11 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=getattr(logging, str(args.log_level).upper(), logging.INFO))
+    logging.basicConfig(
+        level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+        format="%(levelname)s %(name)s: %(message)s",
+        force=True,
+    )
 
     _REMOTE_HEADERS = _load_endpoint_headers_from_env()
     _REMOTE_HEADERS.update(_parse_headers(args.header))
@@ -639,8 +875,8 @@ if __name__ == "__main__":
         flush=True,
     )
     threading.Thread(
-        target=lambda: _run_indexing_or_exit(),
-        daemon=True,
+        target=_run_indexing_background,
         name="graphql-mcp-indexer",
+        daemon=True,
     ).start()
     mcp.run(transport=args.transport, mount_path=args.mount_path)
