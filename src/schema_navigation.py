@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import asdict, dataclass
-from difflib import SequenceMatcher
 from typing import Any
 
 from graphql import (
@@ -48,7 +47,7 @@ class FieldNode:
     is_scalar_return: bool
     is_list_return: bool
     is_reachable: bool
-    coordinates: str | None
+    coordinates: list[str] | None
     root_paths: list[list[dict[str, Any]]]
 
 
@@ -172,7 +171,12 @@ def _build_type_paths(schema: GraphQLSchema) -> dict[str, list[PathStep]]:
     return visited
 
 
-def _render_coordinates(path_steps: list[PathStep], target_type: str, target_field: str, target_args: list[FieldArgument]) -> str | None:
+def _render_coordinates(
+    path_steps: list[PathStep],
+    target_type: str,
+    target_field: str,
+    target_args: list[FieldArgument],
+) -> list[str] | None:
     if not path_steps and target_type != "Query":
         return None
 
@@ -183,10 +187,15 @@ def _render_coordinates(path_steps: list[PathStep], target_type: str, target_fie
     if not path_steps or path_steps[-1].field_name != target_field or path_steps[-1].type_name != target_type:
         include_placeholders = target_type == "Query"
         parts.append(f"{target_type}.{target_field}{_format_args(target_args, placeholders=include_placeholders)}")
-    return " -> ".join(parts)
+    return parts
 
 
-def _build_search_aliases(type_name: str, field_name: str, return_type: str, coordinates: str | None) -> list[str]:
+def _build_search_aliases(
+    type_name: str,
+    field_name: str,
+    return_type: str,
+    coordinates: list[str] | None,
+) -> list[str]:
     base_return = unwrap_named_type_name(return_type)
     aliases = [
         field_name,
@@ -198,7 +207,8 @@ def _build_search_aliases(type_name: str, field_name: str, return_type: str, coo
         f"{field_name} {base_return}",
     ]
     if coordinates:
-        aliases.append(coordinates)
+        aliases.extend(coordinates)
+        aliases.append(" -> ".join(coordinates))
     seen: set[str] = set()
     ordered: list[str] = []
     for alias in aliases:
@@ -241,7 +251,7 @@ def build_field_nodes(schema_text: str) -> list[FieldNode]:
             if description:
                 search_parts.append(description)
             if coordinates:
-                search_parts.append(coordinates)
+                search_parts.append(" -> ".join(coordinates))
 
             nodes.append(
                 FieldNode(
@@ -264,43 +274,3 @@ def build_field_nodes(schema_text: str) -> list[FieldNode]:
             )
 
     return nodes
-
-
-def lexical_similarity(query: str, node: dict[str, Any]) -> float:
-    normalized_query = _normalize(query)
-    if not normalized_query:
-        return 0.0
-
-    query_tokens = tokenize(query)
-    aliases = node.get("search_aliases") or []
-    haystacks = [*aliases, node.get("search_text", ""), node.get("summary", "")]
-    normalized_haystacks = [_normalize(value) for value in haystacks if value]
-    if not normalized_haystacks:
-        return 0.0
-
-    best = 0.0
-    for haystack in normalized_haystacks:
-        if haystack == normalized_query:
-            best = max(best, 1.0)
-            continue
-        if normalized_query in haystack:
-            best = max(best, 0.96)
-        ratio = SequenceMatcher(None, normalized_query, haystack).ratio()
-        best = max(best, ratio * 0.85)
-
-        hay_tokens = haystack.split()
-        if query_tokens and hay_tokens:
-            matches = 0.0
-            for token in query_tokens:
-                token_best = 0.0
-                for hay_token in hay_tokens:
-                    if token == hay_token:
-                        token_best = 1.0
-                        break
-                    if token in hay_token or hay_token in token:
-                        token_best = max(token_best, 0.92)
-                    token_best = max(token_best, SequenceMatcher(None, token, hay_token).ratio())
-                matches += token_best
-            best = max(best, matches / len(query_tokens))
-
-    return min(best, 1.0)

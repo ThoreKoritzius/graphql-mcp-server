@@ -82,26 +82,26 @@ class NavigationIndexTests(unittest.TestCase):
 
         self.assertEqual(
             by_key[("Order", "total")].coordinates,
-            "Query.user(id: <ID!>) -> User.orders -> Order.total",
+            ["Query.user(id: <ID!>)", "User.orders", "Order.total"],
         )
         self.assertEqual(
             by_key[("Query", "users")].coordinates,
-            "Query.users(limit: <Int>)",
+            ["Query.users(limit: <Int>)"],
         )
         self.assertIsNone(by_key[("AdminOnly", "secret")].coordinates)
 
-    def test_hybrid_search_finds_nested_field_from_fuzzy_query(self):
+    def test_embedding_search_finds_nested_field(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             embedder = FakeEmbedder()
             store = EmbeddingStore(Path(tmpdir), embedding_model=embedder.model)
             index_schema_text(SCHEMA, data_dir=Path(tmpdir), embedder=embedder, store=store)
 
-            results = store.hybrid_search("orde totl", embedder.embed_one("orde totl"), limit=5)
+            results = store.search(embedder.embed_one("Order.total -> Float!"), limit=20)
 
-            self.assertEqual(results[0]["type_name"], "Order")
-            self.assertEqual(results[0]["field_name"], "total")
-            self.assertTrue(results[0]["coordinates"].startswith("Query."))
-            self.assertGreater(results[0]["lexical_score"], 0.7)
+            target = next(
+                item for item in results if item["type_name"] == "Order" and item["field_name"] == "total"
+            )
+            self.assertTrue(target["coordinates"][0].startswith("Query."))
 
     def test_list_types_returns_coordinates_query_and_select(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -126,14 +126,14 @@ class NavigationIndexTests(unittest.TestCase):
                 server.store = store
                 server.SCHEMA_PATH = Path("<endpoint>")
 
-                nested = server.list_types("order total", limit=3)
-                query_root = server.list_types("users", limit=3)
+                nested = server.list_types("Order.total -> Float!", limit=20)
+                query_root = server.list_types("Query.users", limit=20)
 
-                nested_top = nested[0]
-                self.assertEqual(nested_top["type"], "Order")
-                self.assertEqual(nested_top["field"], "total")
-                self.assertIn("coordinates", nested_top)
-                self.assertNotIn("query", nested_top)
+                nested_match = next(
+                    item for item in nested if item.get("type") == "Order" and item["field"] == "total"
+                )
+                self.assertIn("coordinates", nested_match)
+                self.assertNotIn("query", nested_match)
 
                 query_match = next(item for item in query_root if item["field"] == "users")
                 self.assertIn("coordinates", query_match)

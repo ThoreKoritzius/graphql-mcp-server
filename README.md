@@ -40,15 +40,22 @@ python3 src/server.py --endpoint https://api.example.com/graphql
 python3 src/src/server.py --endpoint https://api.example.com/graphql --header "Authorization: Bearer $TOKEN"
 # Options: --host 0.0.0.0 --port 9000 --log-level DEBUG --mount-path /myapp
 ```
+Local endpoint test (in-repo example server):
+```bash
+# Terminal 1
+python3 examples/graphql_test_server/server.py
+
+# Terminal 2
+python3 src/server.py --transport sse --endpoint http://127.0.0.1:4000/graphql
+```
+
 Tools:
-- `list_types(query, limit=5)` – hybrid fuzzy search over GraphQL field nodes. Matches can come from `type`, `field`, `type.field`, partial misspellings, return types, and Query-root coordinates. Results include `coordinates` for how to reach a field from `Query`, plus `query` for `Query` fields and `select` for nested object fields.
+- `list_types(query, limit=5)` – embedding-similarity search over GraphQL field nodes. Results are returned by cosine similarity score and include `coordinates` (array of path steps from `Query`), plus `query` for `Query` fields and `select` for nested object fields.
 - `run_query(query)` – if `--endpoint` is set, proxies the query to the endpoint; otherwise validates/runs against the local schema (no resolvers; primarily for validation/shape checking, data resolves to null).
 Both indexing and querying use the same embedding model (`text-embedding-3-small` by default, override via config/env or `--model`).
 
 Ranking (list_types):
-- Hybrid scoring combines lexical fuzzy similarity and embedding similarity across the full indexed field set.
-- Lexical matching is weighted higher than semantic similarity so typo-tolerant field lookup still works when embeddings are weak.
-- Reachable fields and direct `Query` roots receive small secondary boosts.
+- Results are ranked purely by embedding cosine similarity over indexed field-node search text.
 
 Example `list_types` output:
 ```json
@@ -56,20 +63,20 @@ Example `list_types` output:
   {
     "field": "users",
     "summary": "Query.users(limit: Int) -> [User!]!",
-    "coordinates": "Query.users(limit: <Int>)",
+    "coordinates": ["Query.users(limit: <Int>)"],
     "query": "query { users(limit: <Int>) { id name orders { id total status } } }"
   },
   {
     "type": "Order",
     "field": "total",
     "summary": "Order.total -> Float!",
-    "coordinates": "Query.user(id: <ID!>) -> User.orders -> Order.total"
+    "coordinates": ["Query.user(id: <ID!>)", "User.orders", "Order.total"]
   },
   {
     "type": "User",
     "field": "orders",
     "summary": "User.orders -> [Order!]!",
-    "coordinates": "Query.user(id: <ID!>) -> User.orders",
+    "coordinates": ["Query.user(id: <ID!>)", "User.orders"],
     "select": "orders { id total status }"
   }
 ]

@@ -3,7 +3,7 @@ Schema indexing utilities for the GraphQL MCP server.
 
 This module builds a structured field-navigation index from a GraphQL SDL schema,
 embeds the generated search documents via an OpenAI-compatible embeddings endpoint,
-and persists normalized vectors plus field metadata to disk for hybrid retrieval.
+and persists normalized vectors plus field metadata to disk for embedding-similarity retrieval.
 """
 from __future__ import annotations
 
@@ -18,12 +18,12 @@ import numpy as np
 
 from config import load_embedder_config
 from embedding_client import EmbeddingClient
-from schema_navigation import build_field_nodes, lexical_similarity
+from schema_navigation import build_field_nodes
 
 DEFAULT_DATA_DIR = Path(__file__).parent / "data"
 DEFAULT_SCHEMA_PATH = Path(__file__).parent / "schema.graphql"
 DEFAULT_EMBED_BATCH_SIZE = 128
-INDEX_VERSION = 2
+INDEX_VERSION = 3
 
 
 class EmbeddingStore:
@@ -90,7 +90,7 @@ class EmbeddingStore:
         self._meta = meta
         return meta
 
-    def hybrid_search(self, query: str, query_vector: np.ndarray, limit: int = 5) -> list[dict[str, Any]]:
+    def search(self, query_vector: np.ndarray, limit: int = 5) -> list[dict[str, Any]]:
         if self._vectors is None or self._items is None:
             self.load()
 
@@ -99,39 +99,15 @@ class EmbeddingStore:
             return []
 
         limit = max(1, min(limit, len(self._items)))
-        semantic_scores = self._vectors @ query_vector
-
-        ranked: list[dict[str, Any]] = []
-        for idx, item in enumerate(self._items):
-            lexical = lexical_similarity(query, item)
-            semantic = float((semantic_scores[idx] + 1.0) / 2.0)
-            combined = (
-                lexical * 0.62
-                + semantic * 0.30
-                + (0.08 if item.get("is_reachable") else 0.0)
-                + (0.05 if item.get("is_query_root") else 0.0)
-            )
-            ranked.append(
-                {
-                    **item,
-                    "score": float(semantic_scores[idx]),
-                    "semantic_score": semantic,
-                    "lexical_score": lexical,
-                    "combined_score": combined,
-                }
-            )
-
-        ranked.sort(
-            key=lambda item: (
-                item["combined_score"],
-                item.get("is_reachable", False),
-                item.get("is_query_root", False),
-                item.get("type_name", ""),
-                item.get("field_name", ""),
-            ),
-            reverse=True,
-        )
-        return ranked[:limit]
+        scores = self._vectors @ query_vector
+        top_indices = np.argsort(scores)[::-1][:limit]
+        return [
+            {
+                **self._items[idx],
+                "score": float(scores[idx]),
+            }
+            for idx in top_indices
+        ]
 
 
 def _resolve_embedder(
@@ -337,7 +313,7 @@ def search_index(
     store = EmbeddingStore(data_dir=data_dir, embedding_model=embedder.model)
     meta = store.load()
     query_vector = embedder.embed_one(query)
-    results = store.hybrid_search(query, query_vector, limit=limit)
+    results = store.search(query_vector, limit=limit)
     for item in results:
         item["schema_sha"] = meta.get("schema_sha")
     return results

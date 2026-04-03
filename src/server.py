@@ -2,7 +2,7 @@
 GraphQL MCP server exposing `list_types` and `run_query` tools over a schema file or live endpoint.
 
 What it does:
-- Builds and caches a hybrid navigation index of GraphQL field nodes.
+- Builds and caches a navigation index of GraphQL field nodes.
 - Exposes `list_types` for fuzzy discovery with Query-root coordinates.
 - Exposes `run_query` for validation/execution.
 """
@@ -249,7 +249,7 @@ def _render_selection_set(
         return None
 
     def rank(field: dict[str, Any]) -> tuple[float, int, str]:
-        score = float(field.get("lexical_score", 0.0))
+        score = 0.0
         field_name = field.get("field_name", "")
         if field_name in {"id", "name"}:
             score += 0.5
@@ -338,8 +338,8 @@ def list_types(query: str, limit: int = 20) -> list[dict[str, Any]]:
     tokens = tokenize(query)
     capped_limit = max(1, min(limit, 20))
     query_vec = embedder.embed_one(query)
-    ranked = store.hybrid_search(query, query_vec, limit=max(capped_limit * 3, capped_limit))
-    return [_format_result(item, fields_by_type, tokens) for item in ranked[:capped_limit]]
+    ranked = store.search(query_vec, limit=capped_limit)
+    return [_format_result(item, fields_by_type, tokens) for item in ranked]
 
 
 @mcp.tool()
