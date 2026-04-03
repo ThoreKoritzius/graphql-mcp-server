@@ -4,7 +4,7 @@ Python MCP server for LLMs that indexes a GraphQL schema, stores embeddings per 
 
 ## Architecture
 - GraphQL schema: provide a schema file (SDL) to exercise parsing and indexing.
-- Indexer: `schema_indexer.py` flattens the schema into `type.field` signatures (with arguments and return types), embeds each summary via the configured embeddings endpoint, and persists to `data/metadata.json` + `data/vectors.npz` (normalized embeddings for cosine search).
+- Indexer: `schema_indexer.py` builds a navigation index of GraphQL field nodes, including field metadata, fuzzy-search aliases, and Query-root coordinates, then embeds the generated search text and persists to `data/metadata.json` + `data/vectors.npz`.
 - Server: `server.py` exposes MCP tools `list_types` and `run_query`. The server ensures the schema index exists on startup; it only calls the embeddings endpoint when reindexing or embedding a new query.
 - Persistence: `data/` is `.gitignore`'d so you can regenerate locally without polluting the repo.
 
@@ -40,53 +40,44 @@ python3 src/server.py --endpoint https://api.example.com/graphql
 python3 src/src/server.py --endpoint https://api.example.com/graphql --header "Authorization: Bearer $TOKEN"
 # Options: --host 0.0.0.0 --port 9000 --log-level DEBUG --mount-path /myapp
 ```
+Local endpoint test (in-repo example server):
+```bash
+# Terminal 1
+python3 examples/graphql_test_server/server.py
+
+# Terminal 2
+python3 src/server.py --transport sse --endpoint http://127.0.0.1:4000/graphql
+```
+
 Tools:
-- `list_types(query, limit=5)` – fuzzy search over `type.field` signatures (embeddings; auto-build index if missing). Results are ordered by combined score (with a `Query` boost) and include a `query` for `Query` fields plus a `select` hint for object fields. Output is compacted to reduce tokens.
+- `list_types(query, limit=5)` – embedding-similarity search over GraphQL field nodes. Results are returned by cosine similarity score and include `coordinates` (array of path steps from `Query`), plus `query` for `Query` fields and `select` for nested object fields.
 - `run_query(query)` – if `--endpoint` is set, proxies the query to the endpoint; otherwise validates/runs against the local schema (no resolvers; primarily for validation/shape checking, data resolves to null).
 Both indexing and querying use the same embedding model (`text-embedding-3-small` by default, override via config/env or `--model`).
 
-Ranking + cutoff (list_types):
-- Scoring formula (non-aggregate):
-```text
-score =
-  embedding_score
-  + 0.30 * I[is_query]
-  + 0.20 * I[token_match]
-  + 0.15 * I[list_query & connection]
-  + 0.05 * I[list_query & list]
-  - 0.20 * I[list_query & count]
-```
-- Scoring formula (aggregate):
-```text
-score =
-  embedding_score
-  + 0.30 * I[is_query]
-  + 0.25 * I[is_count]
-  + 0.10 * I[is_connection]
-```
-- Dynamic cutoff: keep items where `score >= 0.75 * max_score` or `token_match`; always keep at least 3 and at most `limit`.
-- Diversity guard: when `limit >= 5`, keep up to 3 non-`Query` items if available, with a softer cutoff to avoid `Query`-only starvation.
+Ranking (list_types):
+- Results are ranked purely by embedding cosine similarity over indexed field-node search text.
 
 Example `list_types` output:
 ```json
 [
   {
-    "type": "Query",
     "field": "users",
-    "summary": "Query.users(limit: Int = 10, offset: Int = 0) -> [User!]!",
-    "query": "query { users(limit: <Int = 10>, offset: <Int = 0>) { id name email profile { joinedAt preferences { newsletter } } orders { id status total } } }"
+    "summary": "Query.users(limit: Int) -> [User!]!",
+    "coordinates": ["Query.users(limit: <Int>)"],
+    "query": "query { users(limit: <Int>) { id name orders { id total status } } }"
+  },
+  {
+    "type": "Order",
+    "field": "total",
+    "summary": "Order.total -> Float!",
+    "coordinates": ["Query.user(id: <ID!>)", "User.orders", "Order.total"]
   },
   {
     "type": "User",
     "field": "orders",
     "summary": "User.orders -> [Order!]!",
-    "select": "orders { id status total items { quantity subtotal } }"
-  },
-  {
-    "type": "Product",
-    "field": "reviews",
-    "summary": "Product.reviews -> [Review!]!",
-    "select": "reviews { id rating title author { id name } }"
+    "coordinates": ["Query.user(id: <ID!>)", "User.orders"],
+    "select": "orders { id total status }"
   }
 ]
 ```

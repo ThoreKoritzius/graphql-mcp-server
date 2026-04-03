@@ -1,117 +1,29 @@
 """
 Schema indexing utilities for the GraphQL MCP server.
 
-This module flattens a GraphQL SDL schema into type.field signatures, embeds the
-summaries via an OpenAI-compatible embeddings endpoint, and persists normalized
-vectors to disk for fast similarity search. It is used both by the MCP server
-and the CLI entry point to build/search the local index.
+This module builds a structured field-navigation index from a GraphQL SDL schema,
+embeds the generated search documents via an OpenAI-compatible embeddings endpoint,
+and persists normalized vectors plus field metadata to disk for embedding-similarity retrieval.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
 import json
-import os
-import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from pathlib import Path
-from typing import Iterable, List
+from typing import Any, Iterable
 
 import numpy as np
-from graphql import GraphQLList, GraphQLNonNull, GraphQLObjectType, build_schema
 
 from config import load_embedder_config
 from embedding_client import EmbeddingClient
+from schema_navigation import build_field_nodes
 
 DEFAULT_DATA_DIR = Path(__file__).parent / "data"
 DEFAULT_SCHEMA_PATH = Path(__file__).parent / "schema.graphql"
 DEFAULT_EMBED_BATCH_SIZE = 128
-
-
-@dataclass
-class TypeField:
-    type_name: str
-    field_name: str
-    summary: str
-
-
-def describe_type(graphql_type) -> str:
-    if isinstance(graphql_type, GraphQLNonNull):
-        return f"{describe_type(graphql_type.of_type)}!"
-    if isinstance(graphql_type, GraphQLList):
-        return f"[{describe_type(graphql_type.of_type)}]"
-    return str(graphql_type)
-
-
-def flatten_schema(schema_text: str) -> List[TypeField]:
-    schema = build_schema(schema_text)
-    type_fields: List[TypeField] = []
-
-    for type_name, gql_type in sorted(schema.type_map.items()):
-        if type_name.startswith("__"):
-            continue
-        if not isinstance(gql_type, GraphQLObjectType):
-            continue
-
-        for field_name, field in sorted(gql_type.fields.items()):
-            arg_parts = [
-                f"{arg_name}: {describe_type(arg.type)}"
-                for arg_name, arg in field.args.items()
-            ]
-            arg_list = ", ".join(arg_parts)
-            return_type = describe_type(field.type)
-            signature = (
-                f"{type_name}.{field_name}({arg_list}) -> {return_type}"
-                if arg_list
-                else f"{type_name}.{field_name} -> {return_type}"
-            )
-
-            summary_parts = [signature]
-            if field.description:
-                summary_parts.append(f"desc: {field.description}")
-
-            type_fields.append(
-                TypeField(
-                    type_name=type_name,
-                    field_name=field_name,
-                    summary=" | ".join(summary_parts),
-                )
-            )
-
-    return type_fields
-
-
-def _render_progress(current: int, total: int, width: int = 30) -> str:
-    if total <= 0:
-        return f"[{'-' * width}] 0/0 (0%)"
-    ratio = min(1.0, current / total)
-    filled = int(ratio * width)
-    bar = "#" * filled + "-" * (width - filled)
-    percent = int(ratio * 100)
-    return f"[{bar}] {current}/{total} ({percent}%)"
-
-
-def _embed_with_progress(embedder: EmbeddingClient, summaries: list[str]) -> np.ndarray:
-    total = len(summaries)
-    if total == 0:
-        return np.zeros((0, 0), dtype=np.float32)
-
-    batch_size_raw = os.environ.get("GRAPHQL_EMBED_BATCH_SIZE", str(DEFAULT_EMBED_BATCH_SIZE))
-    try:
-        batch_size = max(1, int(batch_size_raw))
-    except ValueError:
-        batch_size = DEFAULT_EMBED_BATCH_SIZE
-
-    vectors: list[np.ndarray] = []
-    for start in range(0, total, batch_size):
-        batch = summaries[start : start + batch_size]
-        vectors.append(embedder.embed_many(batch))
-        current = min(start + len(batch), total)
-        progress = _render_progress(current, total)
-        print(f"\rIndexing embeddings {progress}", end="", file=sys.stderr, flush=True)
-    print("", file=sys.stderr, flush=True)
-
-    return np.vstack(vectors)
+INDEX_VERSION = 3
 
 
 class EmbeddingStore:
@@ -122,20 +34,18 @@ class EmbeddingStore:
         self.vectors_path = data_dir / "vectors.npz"
 
         self._vectors: np.ndarray | None = None
-        self._items: list[dict] | None = None
-        self._meta: dict | None = None
+        self._items: list[dict[str, Any]] | None = None
+        self._meta: dict[str, Any] | None = None
 
     def is_ready(self) -> bool:
         return self.meta_path.exists() and self.vectors_path.exists()
 
-    def load(self) -> dict:
+    def load(self) -> dict[str, Any]:
         if self._meta and self._vectors is not None and self._items is not None:
             return self._meta
 
         if not self.is_ready():
-            raise FileNotFoundError(
-                f"Index not found in {self.data_dir}. Run the indexer first."
-            )
+            raise FileNotFoundError(f"Index not found in {self.data_dir}. Run the indexer first.")
 
         self._meta = json.loads(self.meta_path.read_text())
         if self._meta.get("embedding_model") != self.embedding_model:
@@ -143,21 +53,28 @@ class EmbeddingStore:
                 "Embedding model mismatch: "
                 f"{self._meta.get('embedding_model')} vs {self.embedding_model}"
             )
+        if self._meta.get("index_version") != INDEX_VERSION:
+            raise ValueError(
+                f"Index version mismatch: {self._meta.get('index_version')} vs {INDEX_VERSION}"
+            )
 
         self._items = self._meta["items"]
         self._vectors = np.load(self.vectors_path)["vectors"]
+        if len(self._items) != len(self._vectors):
+            raise ValueError("Corrupt index: item count does not match vector count")
         return self._meta
 
     def save(
         self,
         vectors: np.ndarray,
-        items: list[dict],
+        items: list[dict[str, Any]],
         schema_sha: str,
-        schema_source: dict | None = None,
-    ) -> dict:
+        schema_source: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self.data_dir.mkdir(parents=True, exist_ok=True)
 
-        meta = {
+        meta: dict[str, Any] = {
+            "index_version": INDEX_VERSION,
             "embedding_model": self.embedding_model,
             "schema_sha": schema_sha,
             "items": items,
@@ -173,21 +90,20 @@ class EmbeddingStore:
         self._meta = meta
         return meta
 
-    def search(self, query_vector: np.ndarray, limit: int = 5) -> list[dict]:
+    def search(self, query_vector: np.ndarray, limit: int = 5) -> list[dict[str, Any]]:
         if self._vectors is None or self._items is None:
             self.load()
 
         assert self._vectors is not None and self._items is not None
+        if not len(self._items):
+            return []
 
         limit = max(1, min(limit, len(self._items)))
         scores = self._vectors @ query_vector
         top_indices = np.argsort(scores)[::-1][:limit]
-
         return [
             {
-                "type": self._items[idx]["type_name"],
-                "field": self._items[idx]["field_name"],
-                "summary": self._items[idx]["summary"],
+                **self._items[idx],
                 "score": float(scores[idx]),
             }
             for idx in top_indices
@@ -205,6 +121,41 @@ def _resolve_embedder(
     return EmbeddingClient(config=config, model=resolved_model)
 
 
+def _render_progress(current: int, total: int, width: int = 30) -> str:
+    if total <= 0:
+        return f"[{'-' * width}] 0/0 (0%)"
+    ratio = min(1.0, current / total)
+    filled = int(ratio * width)
+    bar = "#" * filled + "-" * (width - filled)
+    percent = int(ratio * 100)
+    return f"[{bar}] {current}/{total} ({percent}%)"
+
+
+def _embed_with_progress(embedder: EmbeddingClient, texts: list[str]) -> np.ndarray:
+    total = len(texts)
+    if total == 0:
+        return np.zeros((0, 0), dtype=np.float32)
+
+    import os
+    import sys
+
+    batch_size_raw = os.environ.get("GRAPHQL_EMBED_BATCH_SIZE", str(DEFAULT_EMBED_BATCH_SIZE))
+    try:
+        batch_size = max(1, int(batch_size_raw))
+    except ValueError:
+        batch_size = DEFAULT_EMBED_BATCH_SIZE
+
+    vectors: list[np.ndarray] = []
+    for start in range(0, total, batch_size):
+        batch = texts[start : start + batch_size]
+        vectors.append(embedder.embed_many(batch))
+        current = min(start + len(batch), total)
+        progress = _render_progress(current, total)
+        print(f"\rIndexing embeddings {progress}", end="", file=sys.stderr, flush=True)
+    print("", file=sys.stderr, flush=True)
+    return np.vstack(vectors)
+
+
 def compute_schema_sha(schema_text: str) -> str:
     return hashlib.sha256(schema_text.encode("utf-8")).hexdigest()
 
@@ -216,21 +167,18 @@ def index_schema_text(
     embed_model: str | None = None,
     embedder: EmbeddingClient | None = None,
     store: EmbeddingStore | None = None,
-    schema_source: dict | None = None,
-) -> dict:
-    items = flatten_schema(schema_text)
-    summaries = [item.summary for item in items]
-    embedder = _resolve_embedder(embed_model, embedder)
-    vectors = _embed_with_progress(embedder, summaries)
+    schema_source: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    nodes = build_field_nodes(schema_text)
+    items = [asdict(node) for node in nodes]
+    search_texts = [item["search_text"] for item in items]
 
+    embedder = _resolve_embedder(embed_model, embedder)
+    vectors = _embed_with_progress(embedder, search_texts)
     schema_sha = compute_schema_sha(schema_text)
+
     store = store or EmbeddingStore(data_dir=data_dir, embedding_model=embedder.model)
-    meta = store.save(
-        vectors,
-        [asdict(item) for item in items],
-        schema_sha=schema_sha,
-        schema_source=schema_source,
-    )
+    meta = store.save(vectors, items, schema_sha=schema_sha, schema_source=schema_source)
     meta["count"] = len(items)
     meta["indexed"] = True
     return meta
@@ -242,8 +190,8 @@ def index_schema(
     embed_model: str | None = None,
     embedder: EmbeddingClient | None = None,
     store: EmbeddingStore | None = None,
-    schema_source: dict | None = None,
-) -> dict:
+    schema_source: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     resolved_source = schema_source
     if resolved_source is None:
         try:
@@ -263,18 +211,13 @@ def index_schema(
 def ensure_index_text(
     schema_text: str,
     *,
-    schema_source: dict,
+    schema_source: dict[str, Any],
     data_dir: Path = DEFAULT_DATA_DIR,
     embed_model: str | None = None,
     embedder: EmbeddingClient | None = None,
     store: EmbeddingStore | None = None,
     force: bool = False,
-) -> dict:
-    """
-    Ensure a persisted embedding index exists for a given schema text.
-
-    Rebuilds the index if missing, corrupt, model-mismatched, schema changed, or schema source changed.
-    """
+) -> dict[str, Any]:
     embedder = _resolve_embedder(embed_model, embedder)
     store = store or EmbeddingStore(data_dir=data_dir, embedding_model=embedder.model)
 
@@ -315,12 +258,7 @@ def ensure_index(
     embedder: EmbeddingClient | None = None,
     store: EmbeddingStore | None = None,
     force: bool = False,
-) -> dict:
-    """
-    Ensure a persisted embedding index exists for the given schema.
-
-    Rebuilds the index if missing, corrupt, model-mismatched, or if the schema file changed.
-    """
+) -> dict[str, Any]:
     if not schema_path.exists():
         raise FileNotFoundError(
             "Schema file not found. Provide --schema or set GRAPHQL_SCHEMA_PATH, "
@@ -370,11 +308,10 @@ def search_index(
     embed_model: str | None = None,
     embedder: EmbeddingClient | None = None,
     limit: int = 5,
-) -> list[dict]:
+) -> list[dict[str, Any]]:
     embedder = _resolve_embedder(embed_model, embedder)
     store = EmbeddingStore(data_dir=data_dir, embedding_model=embedder.model)
     meta = store.load()
-
     query_vector = embedder.embed_one(query)
     results = store.search(query_vector, limit=limit)
     for item in results:
@@ -383,26 +320,21 @@ def search_index(
 
 
 def cli(argv: Iterable[str] | None = None) -> int:
-    # Parse arguments and set defaults properly
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default=None, help="Embedding model to use (defaults from env)")
     parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA_PATH, help="Path to the GraphQL schema file")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help="Path to store data files")
 
     subparsers = parser.add_subparsers(dest="command", help="Subcommands")
-
-    # Index subcommand
     index_parser = subparsers.add_parser("index", help="Index the schema into persistent embeddings")
     index_parser.add_argument("--schema", type=Path, default=DEFAULT_SCHEMA_PATH, help="Path to the GraphQL schema file")
 
-    # Search subcommand
     search_parser = subparsers.add_parser("search", help="Search the persisted index with a natural language query")
     search_parser.add_argument("query", help="Search query text")
     search_parser.add_argument("--limit", type=int, default=5, help="Maximum number of results")
 
     args = parser.parse_args(argv)
 
-    # Get the selected model (either from --model or default)
     config = load_embedder_config()
     model_arg = args.model or config.model
     embedder = EmbeddingClient(config=config, model=model_arg)
